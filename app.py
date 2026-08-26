@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import threading
 
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
@@ -17,12 +18,18 @@ session = HTTP(
     api_secret=API_SECRET
 )
 
+
 # =========================
 # НАСТРОЙКИ
 # =========================
 
-RISK_USD = 2.0
-STOP_LOSS_PERCENT = 0.8
+MARGIN_PERCENT = 0.20       # 20% текущего equity
+LEVERAGE = 10               # 10x плечо
+ACCOUNT_COIN = "USDT"
+
+
+# Защита от двух одновременных BUY-сигналов
+trade_lock = threading.Lock()
 
 
 # =========================
@@ -30,6 +37,7 @@ STOP_LOSS_PERCENT = 0.8
 # =========================
 
 def normalize_symbol(symbol):
+
     if not symbol:
         return ""
 
@@ -47,20 +55,138 @@ def normalize_symbol(symbol):
 
 
 # =========================
-# ПОЛУЧЕНИЕ ПОЗИЦИИ
+# ПОЛУЧЕНИЕ EQUITY
+# =========================
+
+def get_current_equity():
+
+    response = session.get_wallet_balance(
+        accountType="UNIFIED",
+        coin=ACCOUNT_COIN
+    )
+
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                "Не удалось получить баланс Bybit"
+            )
+        )
+
+    account_list = response.get(
+        "result", {}
+    ).get(
+        "list", []
+    )
+
+    if not account_list:
+        raise Exception(
+            "Bybit не вернул данные Unified Account"
+        )
+
+    account = account_list[0]
+
+    total_equity = float(
+        account.get("totalEquity", "0") or 0
+    )
+
+    if total_equity <= 0:
+        raise Exception(
+            f"Некорректный equity Bybit: {total_equity}"
+        )
+
+    return total_equity
+
+
+# =========================
+# ПОИСК ЛЮБОЙ ОТКРЫТОЙ ПОЗИЦИИ
+# =========================
+
+def get_any_open_position():
+
+    response = session.get_positions(
+        category="linear",
+        settleCoin=ACCOUNT_COIN
+    )
+
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                "Не удалось получить позиции Bybit"
+            )
+        )
+
+    positions = response.get(
+        "result", {}
+    ).get(
+        "list", []
+    )
+
+    for position in positions:
+
+        symbol = position.get(
+            "symbol",
+            ""
+        )
+
+        side = position.get(
+            "side",
+            ""
+        )
+
+        size = float(
+            position.get(
+                "size",
+                "0"
+            ) or 0
+        )
+
+        if size > 0 and side in ["Buy", "Sell"]:
+
+            return position
+
+    return None
+
+
+# =========================
+# ПОЗИЦИЯ КОНКРЕТНОЙ МОНЕТЫ
 # =========================
 
 def get_position(symbol):
+
     response = session.get_positions(
         category="linear",
         symbol=symbol
     )
 
-    positions = response.get("result", {}).get("list", [])
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                f"Ошибка получения позиции {symbol}"
+            )
+        )
+
+    positions = response.get(
+        "result", {}
+    ).get(
+        "list", []
+    )
 
     for position in positions:
-        side = position.get("side", "")
-        size = float(position.get("size", "0") or 0)
+
+        side = position.get(
+            "side",
+            ""
+        )
+
+        size = float(
+            position.get(
+                "size",
+                "0"
+            ) or 0
+        )
 
         if size > 0 and side in ["Buy", "Sell"]:
             return position
@@ -73,67 +199,144 @@ def get_position(symbol):
 # =========================
 
 def get_price(symbol):
+
     response = session.get_tickers(
         category="linear",
         symbol=symbol
     )
 
-    items = response.get("result", {}).get("list", [])
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                f"Не удалось получить цену {symbol}"
+            )
+        )
+
+    items = response.get(
+        "result", {}
+    ).get(
+        "list",
+        []
+    )
 
     if not items:
-        raise Exception(f"Не удалось получить цену {symbol}")
+        raise Exception(
+            f"Не удалось получить цену {symbol}"
+        )
 
-    return float(items[0]["lastPrice"])
+    return float(
+        items[0]["lastPrice"]
+    )
 
 
 # =========================
-# РАСЧЁТ РАЗМЕРА LONG
+# РАСЧЁТ РАЗМЕРА ПОЗИЦИИ
 # =========================
 
 def calculate_quantity(symbol, price):
 
-    # $2 риска при стопе 0.8%
-    stop_distance = price * (STOP_LOSS_PERCENT / 100)
+    # ---------------------------------
+    # 1. Получаем текущий equity
+    # ---------------------------------
 
-    if stop_distance <= 0:
-        raise Exception("Некорректная цена или стоп")
+    equity = get_current_equity()
 
-    raw_qty = RISK_USD / stop_distance
+    # ---------------------------------
+    # 2. Берём 20% equity как маржу
+    # ---------------------------------
 
-    # Получаем правила количества монеты
+    margin_amount = equity * MARGIN_PERCENT
+
+    # ---------------------------------
+    # 3. Умножаем на 10x
+    # ---------------------------------
+
+    position_usdt = margin_amount * LEVERAGE
+
+    # ---------------------------------
+    # 4. Переводим USDT-позицию
+    #    в количество монет
+    # ---------------------------------
+
+    raw_qty = position_usdt / price
+
+    # ---------------------------------
+    # 5. Получаем правила инструмента
+    # ---------------------------------
+
     response = session.get_instruments_info(
         category="linear",
         symbol=symbol
     )
 
-    instruments = response.get("result", {}).get("list", [])
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                f"Ошибка получения настроек {symbol}"
+            )
+        )
+
+    instruments = response.get(
+        "result", {}
+    ).get(
+        "list",
+        []
+    )
 
     if not instruments:
         raise Exception(
             f"Bybit не нашёл инструмент {symbol}"
         )
 
-    lot_filter = instruments[0].get("lotSizeFilter", {})
+    lot_filter = instruments[0].get(
+        "lotSizeFilter",
+        {}
+    )
 
     min_qty = float(
-        lot_filter.get("minOrderQty", "0")
+        lot_filter.get(
+            "minOrderQty",
+            "0"
+        )
     )
 
     qty_step = float(
-        lot_filter.get("qtyStep", "1")
+        lot_filter.get(
+            "qtyStep",
+            "1"
+        )
     )
 
     if qty_step <= 0:
         qty_step = 1
 
-    # Округляем вниз по шагу
-    qty = math.floor(raw_qty / qty_step) * qty_step
+    # Округляем количество вниз
+    qty = math.floor(
+        raw_qty / qty_step
+    ) * qty_step
 
-    # Не меньше минимального количества
+    # Проверяем минимум
     if qty < min_qty:
         qty = min_qty
 
-    return format(qty, ".12f").rstrip("0").rstrip(".")
+    if qty <= 0:
+        raise Exception(
+            f"Получилось некорректное количество: {qty}"
+        )
+
+    qty_string = format(
+        qty,
+        ".12f"
+    ).rstrip("0").rstrip(".")
+
+    return {
+        "equity": equity,
+        "margin": margin_amount,
+        "position_usdt": position_usdt,
+        "qty": qty_string
+    }
 
 
 # =========================
@@ -142,88 +345,130 @@ def calculate_quantity(symbol, price):
 
 def open_long(symbol):
 
-    # Проверяем, есть ли уже позиция
-    position = get_position(symbol)
+    # =================================
+    # ГЛАВНАЯ ЗАЩИТА:
+    # только ОДНА позиция на аккаунт
+    # =================================
 
-    if position:
-        current_side = position.get("side")
-        current_size = position.get("size")
+    with trade_lock:
 
-        # Long уже открыт
-        if current_side == "Buy":
+        existing_position = get_any_open_position()
+
+        if existing_position:
+
+            existing_symbol = existing_position.get(
+                "symbol",
+                ""
+            )
+
+            existing_side = existing_position.get(
+                "side",
+                ""
+            )
+
+            existing_size = existing_position.get(
+                "size",
+                "0"
+            )
+
             print(
-                f"--> LONG УЖЕ ОТКРЫТ: "
-                f"{symbol}, qty={current_size}"
+                f"--> НОВЫЙ BUY ИГНОРИРУЕМ"
+            )
+
+            print(
+                f"--> УЖЕ ЕСТЬ ПОЗИЦИЯ: "
+                f"{existing_symbol} "
+                f"{existing_side} "
+                f"qty={existing_size}"
             )
 
             return {
-                "status": "already_open",
-                "symbol": symbol,
-                "side": "Buy",
-                "qty": current_size
+                "status": "ignored",
+                "reason": "position_already_open",
+                "existing_symbol": existing_symbol,
+                "existing_side": existing_side,
+                "existing_qty": existing_size
             }
 
-        # Если вдруг остался старый Short,
-        # сначала закрываем его
-        if current_side == "Sell":
+        # =================================
+        # ПОЛУЧАЕМ ЦЕНУ
+        # =================================
 
-            print(
-                f"--> НАЙДЕН SHORT {symbol}, "
-                f"ЗАКРЫВАЕМ ЕГО ПЕРЕД LONG"
-            )
+        price = get_price(symbol)
 
-            close_response = session.place_order(
-                category="linear",
-                symbol=symbol,
-                side="Buy",
-                orderType="Market",
-                qty=str(current_size),
-                reduceOnly=True,
-                positionIdx=0
-            )
+        # =================================
+        # РАССЧИТЫВАЕМ ПОЗИЦИЮ
+        # =================================
 
-            print(
-                f"--> SHORT ЗАКРЫТ: "
-                f"{close_response}"
-            )
-
-    # Получаем цену
-    price = get_price(symbol)
-
-    # Считаем количество под риск $2
-    qty = calculate_quantity(symbol, price)
-
-    print(f"--> ЦЕНА: {price}")
-    print(f"--> РИСК: ${RISK_USD}")
-    print(f"--> СТОП: {STOP_LOSS_PERCENT}%")
-    print(f"--> LONG QTY: {qty}")
-
-    # Открываем LONG
-    response = session.place_order(
-        category="linear",
-        symbol=symbol,
-        side="Buy",
-        orderType="Market",
-        qty=qty,
-        timeInForce="GoodTillCancel",
-        positionIdx=0
-    )
-
-    print(f"--> LONG ОТПРАВЛЕН: {response}")
-
-    if response.get("retCode") != 0:
-        raise Exception(
-            response.get("retMsg", "Ошибка Bybit")
+        sizing = calculate_quantity(
+            symbol,
+            price
         )
 
-    return {
-        "status": "opened",
-        "symbol": symbol,
-        "side": "Buy",
-        "qty": qty,
-        "price": price,
-        "risk_usd": RISK_USD
-    }
+        equity = sizing["equity"]
+        margin = sizing["margin"]
+        position_usdt = sizing["position_usdt"]
+        qty = sizing["qty"]
+
+        print(
+            f"--> ТЕКУЩИЙ EQUITY: ${equity:.2f}"
+        )
+
+        print(
+            f"--> МАРЖА 20%: ${margin:.2f}"
+        )
+
+        print(
+            f"--> ПОЗИЦИЯ 10x: "
+            f"${position_usdt:.2f}"
+        )
+
+        print(
+            f"--> ЦЕНА: {price}"
+        )
+
+        print(
+            f"--> LONG QTY: {qty}"
+        )
+
+        # =================================
+        # ОТКРЫВАЕМ LONG
+        # =================================
+
+        response = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side="Buy",
+            orderType="Market",
+            qty=qty,
+            timeInForce="GoodTillCancel",
+            positionIdx=0
+        )
+
+        print(
+            f"--> LONG ОТПРАВЛЕН: {response}"
+        )
+
+        if response.get("retCode") != 0:
+
+            raise Exception(
+                response.get(
+                    "retMsg",
+                    "Ошибка открытия Bybit"
+                )
+            )
+
+        return {
+            "status": "opened",
+            "symbol": symbol,
+            "side": "Buy",
+            "qty": qty,
+            "price": price,
+            "equity": equity,
+            "margin": margin,
+            "position_usdt": position_usdt,
+            "leverage": LEVERAGE
+        }
 
 
 # =========================
@@ -238,33 +483,30 @@ def close_long(symbol):
     if not position:
 
         print(
-            f"--> SELL ПОЛУЧЕН, НО LONG "
-            f"НЕ ОТКРЫТ: {symbol}"
-        )
-
-        print(
-            "--> SHORT НЕ ОТКРЫВАЕМ"
+            f"--> CLOSE ПОЛУЧЕН, "
+            f"НО LONG НЕ ОТКРЫТ: {symbol}"
         )
 
         return {
             "status": "nothing_to_close",
             "symbol": symbol,
-            "message": "Long отсутствует, Short не открываем"
+            "message": "Long отсутствует"
         }
 
-    current_side = position.get("side")
-    current_size = position.get("size")
+    current_side = position.get(
+        "side"
+    )
 
-    # На всякий случай не трогаем Short
+    current_size = position.get(
+        "size"
+    )
+
+    # Не трогаем Short
     if current_side != "Buy":
 
         print(
             f"--> НАЙДЕН НЕ LONG: "
             f"{current_side} {symbol}"
-        )
-
-        print(
-            "--> НИЧЕГО НЕ ОТКРЫВАЕМ"
         )
 
         return {
@@ -293,8 +535,12 @@ def close_long(symbol):
     )
 
     if response.get("retCode") != 0:
+
         raise Exception(
-            response.get("retMsg", "Ошибка закрытия Bybit")
+            response.get(
+                "retMsg",
+                "Ошибка закрытия Bybit"
+            )
         )
 
     return {
@@ -309,27 +555,37 @@ def close_long(symbol):
 # WEBHOOK
 # =========================
 
-@app.route("/webhook", methods=["POST", "GET"])
+@app.route(
+    "/webhook",
+    methods=["POST", "GET"]
+)
 def webhook():
 
     try:
 
-        data = request.get_json(silent=True)
+        data = request.get_json(
+            silent=True
+        )
 
         if not data:
 
             if request.data:
 
                 try:
+
                     data = json.loads(
-                        request.data.decode("utf-8")
+                        request.data.decode(
+                            "utf-8"
+                        )
                     )
 
                 except Exception:
 
                     data = {
                         "raw":
-                        request.data.decode("utf-8")
+                        request.data.decode(
+                            "utf-8"
+                        )
                     }
 
             else:
@@ -342,18 +598,29 @@ def webhook():
         )
 
         symbol = normalize_symbol(
-            data.get("symbol", "")
+            data.get(
+                "symbol",
+                ""
+            )
         )
 
         action = str(
             data.get(
                 "action",
-                data.get("действие", "")
+                data.get(
+                    "действие",
+                    ""
+                )
             )
         ).strip().lower()
 
-        print(f"--> SYMBOL: {symbol}")
-        print(f"--> ACTION: {action}")
+        print(
+            f"--> SYMBOL: {symbol}"
+        )
+
+        print(
+            f"--> ACTION: {action}"
+        )
 
         if not symbol:
 
@@ -369,15 +636,27 @@ def webhook():
                 "message": "Не указан action"
             }), 400
 
+        # =========================
+        # BUY
+        # =========================
+
         if action in [
             "buy",
             "купить",
             "long"
         ]:
 
-            result = open_long(symbol)
+            result = open_long(
+                symbol
+            )
 
-            return jsonify(result), 200
+            return jsonify(
+                result
+            ), 200
+
+        # =========================
+        # CLOSE
+        # =========================
 
         if action in [
             "sell",
@@ -386,9 +665,13 @@ def webhook():
             "close"
         ]:
 
-            result = close_long(symbol)
+            result = close_long(
+                symbol
+            )
 
-            return jsonify(result), 200
+            return jsonify(
+                result
+            ), 200
 
         return jsonify({
             "status": "error",
@@ -412,7 +695,10 @@ def webhook():
 # HEALTH CHECK
 # =========================
 
-@app.route("/", methods=["GET", "HEAD"])
+@app.route(
+    "/",
+    methods=["GET", "HEAD"]
+)
 def health():
 
     return jsonify({
@@ -428,7 +714,10 @@ def health():
 if __name__ == "__main__":
 
     port = int(
-        os.environ.get("PORT", 10000)
+        os.environ.get(
+            "PORT",
+            10000
+        )
     )
 
     app.run(
