@@ -23,8 +23,8 @@ session = HTTP(
 # НАСТРОЙКИ
 # =========================
 
-MARGIN_PERCENT = 0.20        # 20% текущего equity
-LEVERAGE = 10                # 10x плечо
+MARGIN_PERCENT = 0.20       # 20% текущего equity
+LEVERAGE = 10               # 10x плечо
 ACCOUNT_COIN = "USDT"
 
 
