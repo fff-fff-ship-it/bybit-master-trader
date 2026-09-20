@@ -23,7 +23,7 @@ session = HTTP(
 # НАСТРОЙКИ
 # =========================
 
-MARGIN_PERCENT = 0.10        # 10% текущего equity
+MARGIN_PERCENT = 0.05        # 5% текущего equity
 LEVERAGE = 10                # 10x плечо
 ACCOUNT_COIN = "USDT"
 
@@ -243,7 +243,7 @@ def calculate_quantity(symbol, price):
     equity = get_current_equity()
 
     # ---------------------------------
-    # 2. Берём 10% equity как маржу
+    # 2. Берём 5% equity как маржу
     # ---------------------------------
 
     margin_amount = equity * MARGIN_PERCENT
@@ -415,7 +415,7 @@ def open_long(symbol):
         )
 
         print(
-            f"--> МАРЖА 10%: ${margin:.2f}"
+            f"--> МАРЖА 5%: ${margin:.2f}"
         )
 
         print(
